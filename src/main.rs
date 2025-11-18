@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::Context;
 use byteorder::{ByteOrder, LittleEndian};
 use capstone::arch;
 use capstone::arch::arm64::{Arm64Insn, Arm64OperandType};
@@ -363,8 +363,8 @@ fn arm64_store_imm(mem: &Mem, addr: u64) -> anyhow::Result<u32> {
             || id == Arm64Insn::ARM64_INS_STRH as u32 =>
         {
             let detail = cs.insn_detail(&insn)?;
-            let arch = detail
-                .arch_detail()
+            let arch_detail = detail.arch_detail();
+            let arch = arch_detail
                 .arm64()
                 .ok_or_else(|| anyhow::anyhow!("no arm64 detail"))?;
 
