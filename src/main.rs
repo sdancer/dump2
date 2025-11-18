@@ -85,8 +85,8 @@ struct SegmentInfo {
     vmsize: u64,
     fileoff: u64,
     filesize: u64,
+    name: String,
 }
-
 struct Mem<'a> {
     data: &'a [u8],
     segments: Vec<SegmentInfo>,
@@ -101,11 +101,17 @@ impl<'a> Mem<'a> {
         let mut segments = Vec::new();
 
         for seg in macho.segments.iter() {
+            let seg_name = seg
+                .name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+
             segments.push(SegmentInfo {
                 vmaddr: seg.vmaddr,
                 vmsize: seg.vmsize,
                 fileoff: seg.fileoff,
                 filesize: seg.filesize,
+                name: seg_name,
             });
         }
 
@@ -490,6 +496,79 @@ fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<EnumDef> {
     map.into_values().collect()
 }
 
+fn scan_all_segments_for_packets_and_structs(
+    mem: &Mem,
+) -> Result<(Vec<PacketInfo>, Vec<PacketInfo>), anyhow::Error> {
+    let mut packets = Vec::new();
+    let mut structs = Vec::new();
+
+    let common_source = 0x0000_0001_05d1_f850u64;
+    let packet_prologue = 0x0000_0001_060b_1e68u64;
+
+    // Scan EVERY segment that has actual file backing (filesize > 0)
+    for seg in &mem.segments {
+        println!("seg  {} {:X}  {:X}", seg.name, seg.vmaddr, seg.vmaddr + seg.filesize);
+        if seg.filesize <= 16 {
+            continue;
+        }
+
+        let start = seg.fileoff as usize;
+        let end = start + seg.filesize as usize;
+
+        if end > mem.data.len() {
+            println!("invalid seg");
+            continue;
+        }
+
+
+        let slice = &mem.data[start..end];
+        let base_addr = seg.vmaddr;
+ 
+        let q0 = LittleEndian::read_u64(&slice[0..8]);
+        println!("> {:X}", q0);
+
+      
+        // Step by 8-byte alignment (most UE static objects are 16-byte aligned, but 8 is safer)
+        let upper = slice.len().saturating_sub(16);
+
+        for off in (0..upper).step_by(8) {
+
+            let addr = base_addr + off as u64;
+            let q0 = LittleEndian::read_u64(&slice[off..off + 8]);
+            if ((q0 >> 32) & 0xffffffff) == 1 {
+            println!("{:X}  {:X}", addr, q0);
+
+}
+
+            if q0 != common_source {
+                continue;
+            }
+            println!("found {}", q0);
+
+            let q1 = LittleEndian::read_u64(&slice[off + 8..off + 16]);
+
+            if q1 == packet_prologue {
+                if let Ok((_, pkt)) = read_packet(&mem, addr) {
+                    packets.push(pkt);
+                }
+            } else if q1 == 0 {
+                if let Ok(cls) = read_packet(&mem, addr) {
+                    structs.push(cls.1);
+                }
+            }
+        }
+    }
+
+    // Deduplicate just in case the same object appears in multiple segments (shouldn't happen, but safe)
+    packets.sort_by_key(|p| p.name.clone());
+    packets.dedup_by_key(|p| p.name.clone());
+
+    structs.sort_by_key(|p| p.name.clone());
+    structs.dedup_by_key(|p| p.name.clone());
+
+    Ok((packets, structs))
+}
+
 fn main() -> Result<(), anyhow::Error> {
     let path = std::env::args()
         .nth(1)
@@ -498,46 +577,28 @@ fn main() -> Result<(), anyhow::Error> {
     let map = unsafe { Mmap::map(&file)? };
     let mem = Mem::new(&map)?;
 
-    let common_source = *mem
-        .name2addr
-        .get("_Z41Z_Construct_UPackage__Script_CommonSourcev")
-        .context("symbol CommonSource not found")?;
+    let common_source = 0x0000_0001_05d1_f850u64;
+    let packet_prologue = 0x0000_0001_060b_1e68u64;
 
-    let protocol_base = *mem
-        .name2addr
-        .get("_Z39Z_Construct_UScriptStruct_FBaseProtocolv")
-        .context("symbol FBaseProtocol not found")?;
+    //let protocol_base = *mem
+    //    .name2addr
+    //    .get("_Z39Z_Construct_UScriptStruct_FBaseProtocolv")
+    //    .context("symbol FBaseProtocol not found")?;
 
     let enums = scan_for_enums(&mem, common_source);
+    println!("enums: {}", enums.len());
 
-    println!("{} {}", common_source, protocol_base);
+
+    //println!("{} {}", common_source, protocol_base);
     println!("Non-function symbols: {}", mem.data_symbols.len());
 
-    let mut packets = Vec::<PacketInfo>::new();
-    let mut structs = Vec::<PacketInfo>::new();
+    let (mut packets, mut structs) = scan_all_segments_for_packets_and_structs(&mem)?;
 
-    for (_name, addr) in &mem.data_symbols {
-        let q0 = match mem.read_u64(*addr) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if q0 != common_source {
-            continue;
-        }
-
-        let q1 = mem.read_u64(addr + 8)?;
-        if q1 != 0 {
-            if let Ok((_, pkt)) = read_packet(&mem, *addr) {
-                packets.push(pkt);
-            }
-            continue;
-        }
-
-        if let Ok(cls) = read_packet(&mem, *addr) {
-            structs.push(cls.1);
-        }
-    }
-
+    println!(
+        "Scan complete → {} packets, {} structs/enums found (across all segments)",
+        packets.len(),
+        structs.len()
+    );
     let json = serde_json::to_string_pretty(&packets)?;
     fs::write("packets.json", &json)?;
 
