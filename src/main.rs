@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use goblin::mach::Mach;
+use goblin::mach::{Mach, SingleArch};
 use goblin::Object;
 use std::env;
 use std::fs;
@@ -76,22 +76,16 @@ fn main() -> Result<()> {
     // Handle thin Mach-O or first arch of fat Mach-O
     let macho = match mach {
         Mach::Binary(m) => m,
-    Mach::Fat(fat) => {
-        // fat.arches() -> Result<Vec<FatArch>, _>   in goblin 0.8
-        let arches = fat
-            .arches()
-            .with_context(|| "Failed to list architectures in fat Mach-O")?;
+        Mach::Fat(fat) => {
+            let first_arch = fat
+                .get(0)
+                .with_context(|| "Failed to parse first arch in fat Mach-O")?;
 
-        if arches.is_empty() {
-            bail!("No architectures in fat Mach-O");
+            match first_arch {
+                SingleArch::MachO(m) => m,
+                SingleArch::Archive(_) => bail!("First architecture is an archive, not Mach-O"),
+            }
         }
-
-        let first_arch = &arches[0];
-
-        first_arch
-            .parse(&buf)
-            .with_context(|| "Failed to parse first arch in fat Mach-O")?
-    }
     };
 
 
@@ -99,10 +93,8 @@ fn main() -> Result<()> {
     let mut orig_base: Option<u64> = None;
 
     for seg in macho.segments.iter() {
-        if let Ok(seghdr) = seg {
-            orig_base = Some(seghdr.vmaddr);
-            break;
-        }
+        orig_base = Some(seg.vmaddr);
+        break;
     }
 
     let orig_base = orig_base.ok_or_else(|| anyhow::anyhow!("Could not determine original base"))?;
@@ -123,11 +115,6 @@ fn main() -> Result<()> {
 
     // Iterate segments and their sections
     for (seg_idx, seg) in macho.segments.iter().enumerate() {
-        let seg = match seg {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
         let seg_name = seg.name().unwrap_or("").to_string();
         let seg_vmaddr = seg.vmaddr;
         let seg_file_off = seg.fileoff;
@@ -139,12 +126,7 @@ fn main() -> Result<()> {
             Err(_) => continue,
         };
 
-        for (sect_idx, sect) in sections.iter().enumerate() {
-            let sect = match sect {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
+        for (sect_idx, (sect, _sect_data)) in sections.iter().enumerate() {
             let sect_name = sect.name().unwrap_or("").to_string();
             let sect_vmaddr = sect.addr;
             let sect_size = sect.size;
