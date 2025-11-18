@@ -1,0 +1,9 @@
+[package]
+name = "farm2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+goblin = { version = "0.8", features = ["std", "mach32", "mach64"] }
+anyhow = "1"
+hex = "0.4"
