@@ -498,10 +498,8 @@ fn main() -> Result<(), anyhow::Error> {
     let map = unsafe { Mmap::map(&file)? };
     let mem = Mem::new(&map)?;
 
-    let common_source = *mem
-        .name2addr
-        .get("_Z41Z_Construct_UPackage__Script_CommonSourcev")
-        .context("symbol CommonSource not found")?;
+    let common_source = 0x0000_0001_05d1_f850u64;
+    let packet_prologue = 0x0000_0001_060b_1e68u64;
 
     let protocol_base = *mem
         .name2addr
@@ -526,15 +524,17 @@ fn main() -> Result<(), anyhow::Error> {
         }
 
         let q1 = mem.read_u64(addr + 8)?;
-        if q1 != 0 {
+        if q1 == packet_prologue {
             if let Ok((_, pkt)) = read_packet(&mem, *addr) {
                 packets.push(pkt);
             }
             continue;
         }
 
-        if let Ok(cls) = read_packet(&mem, *addr) {
-            structs.push(cls.1);
+        if q1 == 0 {
+            if let Ok(cls) = read_packet(&mem, *addr) {
+                structs.push(cls.1);
+            }
         }
     }
 
