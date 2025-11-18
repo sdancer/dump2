@@ -89,12 +89,26 @@ fn main() -> Result<()> {
     };
 
 
-    // Determine original base as vmaddr of the first segment (usually __TEXT)
+    // Determine the original base address.
+    // Prefer the __TEXT segment, otherwise fall back to the first segment that
+    // actually has file-backed bytes (skipping things like __PAGEZERO).
     let mut orig_base: Option<u64> = None;
 
     for seg in macho.segments.iter() {
-        orig_base = Some(seg.vmaddr);
-        break;
+        if seg.filesize == 0 {
+            continue;
+        }
+
+        if let Ok(name) = seg.name() {
+            if name == "__TEXT" {
+                orig_base = Some(seg.vmaddr);
+                break;
+            }
+        }
+
+        if orig_base.is_none() {
+            orig_base = Some(seg.vmaddr);
+        }
     }
 
     let orig_base = orig_base.ok_or_else(|| anyhow::anyhow!("Could not determine original base"))?;
