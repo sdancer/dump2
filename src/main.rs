@@ -4,12 +4,11 @@ use capstone::arch;
 use capstone::arch::arm64::{Arm64Insn, Arm64OperandType};
 use capstone::prelude::*;
 use goblin::Object;
-use goblin::mach::MachO;
-use goblin::mach::{Mach, SingleArch};
+use goblin::mach::{Mach, MachO, SingleArch};
 use memmap2::Mmap;
 use regex::Regex;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -87,6 +86,7 @@ struct SegmentInfo {
     filesize: u64,
     name: String,
 }
+
 struct Mem<'a> {
     data: &'a [u8],
     segments: Vec<SegmentInfo>,
@@ -99,13 +99,11 @@ impl<'a> Mem<'a> {
     fn new(data: &'a [u8]) -> Result<Self, anyhow::Error> {
         let macho = parse_macho(data)?;
         let mut segments = Vec::new();
-
         for seg in macho.segments.iter() {
             let seg_name = seg
                 .name()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|_| "<unknown>".to_string());
-
             segments.push(SegmentInfo {
                 vmaddr: seg.vmaddr,
                 vmsize: seg.vmsize,
@@ -114,9 +112,7 @@ impl<'a> Mem<'a> {
                 name: seg_name,
             });
         }
-
         let (addr2name, name2addr, data_symbols) = build_symbol_maps(&macho);
-
         Ok(Self {
             data,
             segments,
@@ -159,15 +155,19 @@ impl<'a> Mem<'a> {
         let off = self
             .vaddr_to_off(vaddr)
             .ok_or_else(|| anyhow::anyhow!("string addr {:#x} outside mapped segments", vaddr))?;
-
         let slice = &self.data[off..];
         let nul = slice
             .iter()
             .position(|&b| b == 0)
             .ok_or_else(|| anyhow::anyhow!("unterminated ASCII @ {:#x}", vaddr))?;
-
         Ok(std::str::from_utf8(&slice[..nul])?.to_owned())
     }
+}
+
+// Critical fixup for UE Mach-O truncated 32-bit pointers
+#[inline]
+fn fixup_pointer(ptr: u64) -> u64 {
+    (ptr & 0xffffffff) + 0x100000000
 }
 
 fn parse_macho<'a>(data: &'a [u8]) -> Result<MachO<'a>, anyhow::Error> {
@@ -176,7 +176,6 @@ fn parse_macho<'a>(data: &'a [u8]) -> Result<MachO<'a>, anyhow::Error> {
         Object::Mach(m) => m,
         _ => anyhow::bail!("File is not a Mach-O image"),
     };
-
     Ok(match mach {
         Mach::Binary(macho) => macho,
         Mach::Fat(fat) => {
@@ -201,43 +200,44 @@ fn build_symbol_maps(
     let mut addr2name = HashMap::<u64, String>::new();
     let mut name2addr = HashMap::<String, u64>::new();
     let mut data_symbols = Vec::<(String, u64)>::new();
-
     for sym in macho.symbols() {
         let Ok((name, nlist)) = sym else { continue };
         if name.is_empty() || nlist.n_value == 0 || nlist.is_undefined() || nlist.is_stab() {
             continue;
         }
-
         let owned = name.to_owned();
         let addr = nlist.n_value;
-
         addr2name.entry(addr).or_insert_with(|| owned.clone());
         name2addr.entry(owned.clone()).or_insert(addr);
         data_symbols.push((owned, addr));
     }
-
     (addr2name, name2addr, data_symbols)
 }
 
 fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error> {
     let rec = mem.read_bytes(entry, 72)?;
-    let s_name = mem.get_ascii_string(LittleEndian::read_u64(&rec[24..32]))?;
+    let s_name_raw = LittleEndian::read_u64(&rec[24..32]);
+    let s_name = fixup_pointer(s_name_raw);
+    let name = mem.get_ascii_string(s_name)?;
 
-    let u_size = LittleEndian::read_u64(&rec[32..40]);
-    let u_flags = LittleEndian::read_u64(&rec[40..48]);
-    let p_fields = LittleEndian::read_u64(&rec[48..56]);
-    let field_cnt = LittleEndian::read_u32(&rec[56..60]) as usize;
+    //let u_size = LittleEndian::read_u64(&rec[32..40]);
+    //let u_flags = LittleEndian::read_u64(&rec[40..48]);
+    let p_fields_raw = LittleEndian::read_u64(&rec[32..40]);
+    let p_fields = fixup_pointer(p_fields_raw);
+    let field_cnt = LittleEndian::read_u32(&rec[40..44]) as usize;
 
-    let fields = read_fields(mem, p_fields, field_cnt)?;
+    println!("{} {:X} {:X} {:X}", name, entry, p_fields, field_cnt);
+
+    let fields = read_fields(mem, p_fields, field_cnt & 0xffff)?;
     let mut fields = collapse_fields(fields);
     fields.sort_by_key(|f| f.offset);
 
     Ok((
         entry,
         PacketInfo {
-            name: s_name,
-            mem_size: u_size,
-            flags: u_flags,
+            name,
+            mem_size: 0,
+            flags: 0,
             fields,
         },
     ))
@@ -246,10 +246,8 @@ fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error
 fn collapse_fields(fields: Vec<Field>) -> Vec<Field> {
     let mut out = Vec::with_capacity(fields.len());
     let mut i = 0;
-
     while i < fields.len() {
         let mut cur = fields[i].clone();
-
         if cur.name == "UnderlyingType" && i + 1 < fields.len() {
             if let FieldType::Enum { .. } = fields[i + 1].f_type {
                 let mut enum_field = fields[i + 1].clone();
@@ -261,7 +259,6 @@ fn collapse_fields(fields: Vec<Field>) -> Vec<Field> {
                 continue;
             }
         }
-
         if matches!(cur.f_type, FieldType::Array(_))
             && !out.is_empty()
             && out.last().unwrap().name == cur.name
@@ -272,11 +269,9 @@ fn collapse_fields(fields: Vec<Field>) -> Vec<Field> {
             i += 1;
             continue;
         }
-
         out.push(cur);
         i += 1;
     }
-
     out
 }
 
@@ -286,14 +281,19 @@ fn read_enum(mem: &Mem, entry: u64) -> Option<EnumDef> {
         return None;
     }
 
-    let name_ptr = LittleEndian::read_u64(&hdr[16..24]);
-    let name_dup = LittleEndian::read_u64(&hdr[24..32]);
+    let name_ptr_raw = LittleEndian::read_u64(&hdr[16..24]);
+    let name_dup_raw = LittleEndian::read_u64(&hdr[24..32]);
+    let name_ptr = fixup_pointer(name_ptr_raw);
+    let name_dup = fixup_pointer(name_dup_raw);
+
     if name_ptr != name_dup {
         return None;
     }
 
-    let fields_ptr = LittleEndian::read_u64(&hdr[32..40]);
+    let fields_ptr_raw = LittleEndian::read_u64(&hdr[32..40]);
+    let fields_ptr = fixup_pointer(fields_ptr_raw);
     let field_cnt = LittleEndian::read_u32(&hdr[40..44]) as usize;
+
     if LittleEndian::read_u64(&hdr[44..52]) != 0x45 {
         return None;
     }
@@ -304,14 +304,13 @@ fn read_enum(mem: &Mem, entry: u64) -> Option<EnumDef> {
 
     for i in 0..field_cnt {
         let p = i * 16;
-        let fname_ptr = LittleEndian::read_u64(&blob[p..p + 8]);
+        let fname_ptr_raw = LittleEndian::read_u64(&blob[p..p + 8]);
+        let fname_ptr = fixup_pointer(fname_ptr_raw);
         let value = LittleEndian::read_u64(&blob[p + 8..p + 16]);
-
         let mut fname = mem.get_ascii_string(fname_ptr).ok()?;
         if let Some(stripped) = fname.strip_prefix(&format!("{}::", name)) {
             fname = stripped.to_owned();
         }
-
         fields.push((fname, value));
     }
 
@@ -332,20 +331,16 @@ fn read_fields(mem: &Mem, arr_ptr: u64, count: usize) -> anyhow::Result<Vec<Fiel
     if count == 0 {
         return Ok(Vec::new());
     }
-
     let ptrs = mem.read_bytes(arr_ptr, count * 8)?;
-
     let mut out_rev = Vec::with_capacity(count);
     let mut i: isize = count as isize - 1;
-
     while i >= 0 {
-        let field_addr = LittleEndian::read_u64(&ptrs[(i as usize) * 8..][..8]);
+        let field_addr_raw = LittleEndian::read_u64(&ptrs[(i as usize) * 8..][..8]);
+        let field_addr = fixup_pointer(field_addr_raw);
         let field = read_field(mem, field_addr)?;
-
         out_rev.push(field);
         i -= 1;
     }
-
     Ok(out_rev)
 }
 
@@ -356,12 +351,8 @@ fn arm64_store_imm(mem: &Mem, addr: u64) -> anyhow::Result<u32> {
         .mode(arch::arm64::ArchMode::Arm)
         .detail(true)
         .build()?;
-
     let insns = cs.disasm_all(bytes, addr)?;
-    let insn = insns
-        .iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no insn"))?;
+    let insn = insns.iter().next().ok_or_else(|| anyhow::anyhow!("no insn"))?;
 
     match insn.id().0 {
         id if id == Arm64Insn::ARM64_INS_STR as u32
@@ -370,10 +361,7 @@ fn arm64_store_imm(mem: &Mem, addr: u64) -> anyhow::Result<u32> {
         {
             let detail = cs.insn_detail(&insn)?;
             let arch_detail = detail.arch_detail();
-            let arch = arch_detail
-                .arm64()
-                .ok_or_else(|| anyhow::anyhow!("no arm64 detail"))?;
-
+            let arch = arch_detail.arm64().ok_or_else(|| anyhow::anyhow!("no arm64 detail"))?;
             for op in arch.operands() {
                 if let Arm64OperandType::Mem(ref m) = op.op_type {
                     return Ok(m.disp() as u32);
@@ -408,8 +396,8 @@ fn clean_uobject_sym(sym: &str) -> String {
 
 fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
     let rec = mem.read_bytes(field_addr, 0x38)?;
-
-    let s_name = LittleEndian::read_u64(&rec[0..8]);
+    let s_name_raw = LittleEndian::read_u64(&rec[0..8]);
+    let s_name = fixup_pointer(s_name_raw);
     let unk1 = LittleEndian::read_u64(&rec[8..16]);
     let unk2 = LittleEndian::read_u32(&rec[16..20]);
     let unk3 = LittleEndian::read_u32(&rec[20..24]);
@@ -417,8 +405,9 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
     let unk4 = LittleEndian::read_u32(&rec[28..32]);
     let unk5 = LittleEndian::read_u32(&rec[32..36]);
     let raw_offset = LittleEndian::read_u32(&rec[36..40]);
-    let func_desc = LittleEndian::read_u64(&rec[40..48]);
-    let func_desc1 = LittleEndian::read_u64(&rec[48..56]);
+    let func_desc_raw = LittleEndian::read_u64(&rec[40..48]);
+    let func_desc = fixup_pointer(func_desc_raw);
+    let func_desc1 = LittleEndian::read_u64(&rec[48..56]); // code pointer — no fixup
 
     let name = mem.get_ascii_string(s_name)?;
 
@@ -450,21 +439,16 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
 }
 
 fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<EnumDef> {
-    use std::collections::BTreeMap;
-
     let mut map = BTreeMap::<String, EnumDef>::new();
-
     for seg in &mem.segments {
         if seg.filesize == 0 {
             continue;
         }
-
         let start = seg.fileoff as usize;
         let end = start + seg.filesize as usize;
         if end > mem.data.len() {
             continue;
         }
-
         let seg_slice = &mem.data[start..end];
         let base = seg.vmaddr;
         let upper = seg_slice.len().saturating_sub(40);
@@ -474,25 +458,21 @@ fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<EnumDef> {
             if q0 != common_source {
                 continue;
             }
-
             let q1 = LittleEndian::read_u64(&seg_slice[off + 8..off + 16]);
             if q1 != 0 {
                 continue;
             }
-
             let q3 = LittleEndian::read_u64(&seg_slice[off + 16..off + 24]);
             let q4 = LittleEndian::read_u64(&seg_slice[off + 24..off + 32]);
             if q3 != q4 {
                 continue;
             }
-
             let addr = base + off as u64;
             if let Some(e) = read_enum(mem, addr) {
                 map.entry(e.name.clone()).or_insert(e);
             }
         }
     }
-
     map.into_values().collect()
 }
 
@@ -501,68 +481,40 @@ fn scan_all_segments_for_packets_and_structs(
 ) -> Result<(Vec<PacketInfo>, Vec<PacketInfo>), anyhow::Error> {
     let mut packets = Vec::new();
     let mut structs = Vec::new();
-
     let common_source = 0x0000_0001_05d1_f850u64;
-    let packet_prologue = 0x0000_0001_060b_1e68u64;
+    let packet_prologue = 0x0000_0001_060b_1e68u64; // Update if needed for your binary
 
-    // Scan EVERY segment that has actual file backing (filesize > 0)
     for seg in &mem.segments {
-        println!("seg  {} {:X}  {:X}", seg.name, seg.vmaddr, seg.vmaddr + seg.filesize);
         if seg.filesize <= 16 {
             continue;
         }
-
         let start = seg.fileoff as usize;
         let end = start + seg.filesize as usize;
-
         if end > mem.data.len() {
-            println!("invalid seg");
             continue;
         }
-
-
         let slice = &mem.data[start..end];
         let base_addr = seg.vmaddr;
- 
-        let q0 = LittleEndian::read_u64(&slice[0..8]);
-        println!("> {:X}", q0);
-
-      
-        // Step by 8-byte alignment (most UE static objects are 16-byte aligned, but 8 is safer)
         let upper = slice.len().saturating_sub(16);
 
         for off in (0..upper).step_by(8) {
-
             let addr = base_addr + off as u64;
             let q0 = LittleEndian::read_u64(&slice[off..off + 8]);
-            if ((q0 >> 32) & 0xffffffff) == 1 {
-            println!("{:X}  {:X}", addr, q0);
-
-}
-
-            if q0 != common_source {
+            if (q0 & 0xffffffff) != (common_source & 0xffffffff) {
                 continue;
             }
-            println!("found {}", q0);
-
             let q1 = LittleEndian::read_u64(&slice[off + 8..off + 16]);
 
-            if q1 == packet_prologue {
-                if let Ok((_, pkt)) = read_packet(&mem, addr) {
-                    packets.push(pkt);
+            
+                if let Ok((_, cls)) = read_packet(&mem, addr) {
+                    structs.push(cls);
                 }
-            } else if q1 == 0 {
-                if let Ok(cls) = read_packet(&mem, addr) {
-                    structs.push(cls.1);
-                }
-            }
+            
         }
     }
 
-    // Deduplicate just in case the same object appears in multiple segments (shouldn't happen, but safe)
-    packets.sort_by_key(|p| p.name.clone());
-    packets.dedup_by_key(|p| p.name.clone());
-
+    //packets.sort_by_key(|p| p.name.clone());
+    //packets.dedup_by_key(|p| p.name.clone());
     structs.sort_by_key(|p| p.name.clone());
     structs.dedup_by_key(|p| p.name.clone());
 
@@ -578,45 +530,29 @@ fn main() -> Result<(), anyhow::Error> {
     let mem = Mem::new(&map)?;
 
     let common_source = 0x0000_0001_05d1_f850u64;
-    let packet_prologue = 0x0000_0001_060b_1e68u64;
-
-    //let protocol_base = *mem
-    //    .name2addr
-    //    .get("_Z39Z_Construct_UScriptStruct_FBaseProtocolv")
-    //    .context("symbol FBaseProtocol not found")?;
-
     let enums = scan_for_enums(&mem, common_source);
-    println!("enums: {}", enums.len());
-
-
-    //println!("{} {}", common_source, protocol_base);
-    println!("Non-function symbols: {}", mem.data_symbols.len());
+    println!("Found {} enums", enums.len());
 
     let (mut packets, mut structs) = scan_all_segments_for_packets_and_structs(&mem)?;
-
     println!(
-        "Scan complete → {} packets, {} structs/enums found (across all segments)",
+        "Scan complete → {} packets, {} structs found",
         packets.len(),
         structs.len()
     );
+
     let json = serde_json::to_string_pretty(&packets)?;
     fs::write("packets.json", &json)?;
-
     let json = serde_json::to_string_pretty(&enums)?;
     fs::write("enums.json", &json)?;
 
     fs::create_dir_all("out").ok();
-
     packets.extend(structs);
-
-    let parts = 64usize.max(1);
-    let per_part = (packets.len() + parts - 1) / parts;
+    let per_part = (packets.len() + 63) / 64;
 
     for (idx, chunk) in packets.chunks(per_part).enumerate() {
         if chunk.is_empty() {
             break;
         }
-
         let fname = format!("out/packets_{:02}.ex", idx);
         let body = generate_elixir_chunk(chunk);
         fs::write(&fname, body)?;
@@ -659,9 +595,7 @@ fn elixir_type(ft: &FieldType) -> String {
 
 fn generate_elixir_chunk(packets: &[PacketInfo]) -> String {
     use std::fmt::Write;
-
     let mut out = String::with_capacity(2048);
-
     writeln!(out, "# Auto-generated: DO NOT EDIT").unwrap();
     writeln!(out, "import PacketDSL\n").unwrap();
 
@@ -679,6 +613,5 @@ fn generate_elixir_chunk(packets: &[PacketInfo]) -> String {
         }
         writeln!(out, "end\n").unwrap();
     }
-
     out
 }
