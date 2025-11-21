@@ -615,3 +615,99 @@ fn generate_elixir_chunk(packets: &[PacketInfo]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    const TESTDATA_PATH: &str = "testdata/macho_fixture";
+    const DATA_LEN: usize = 0x100000;
+    const BASE_ADDR: u64 = 0x10c400000;
+    const PACKET_ONE_ADDR: u64 = 0x10c4fecc8;
+    const PACKET_TWO_ADDR: u64 = 0x10c4fee98;
+
+    fn write_macho_fixture(path: &Path) -> anyhow::Result<()> {
+        fs::create_dir_all(path.parent().unwrap())?;
+
+        let mut file = vec![0u8; 0x1000 + DATA_LEN];
+        // mach_header_64
+        LittleEndian::write_u32(&mut file[0..4], 0xfeedfacf); // magic
+        LittleEndian::write_u32(&mut file[4..8], 0x0100000c); // cputype arm64
+        LittleEndian::write_u32(&mut file[8..12], 0); // cpusubtype
+        LittleEndian::write_u32(&mut file[12..16], 2); // filetype: MH_EXECUTE
+        LittleEndian::write_u32(&mut file[16..20], 2); // ncmds
+        LittleEndian::write_u32(&mut file[20..24], 0x60); // sizeofcmds
+        LittleEndian::write_u32(&mut file[24..28], 0); // flags
+        LittleEndian::write_u32(&mut file[28..32], 0); // reserved
+
+        // LC_SEGMENT_64
+        let seg_off = 0x20;
+        LittleEndian::write_u32(&mut file[seg_off..seg_off + 4], 0x19);
+        LittleEndian::write_u32(&mut file[seg_off + 4..seg_off + 8], 0x48);
+        file[seg_off + 8..seg_off + 18].copy_from_slice(b"__TEST_SEG");
+        LittleEndian::write_u64(&mut file[seg_off + 24..seg_off + 32], BASE_ADDR);
+        LittleEndian::write_u64(&mut file[seg_off + 32..seg_off + 40], DATA_LEN as u64);
+        LittleEndian::write_u64(&mut file[seg_off + 40..seg_off + 48], 0x1000);
+        LittleEndian::write_u64(&mut file[seg_off + 48..seg_off + 56], DATA_LEN as u64);
+        LittleEndian::write_u32(&mut file[seg_off + 56..seg_off + 60], 7); // maxprot
+        LittleEndian::write_u32(&mut file[seg_off + 60..seg_off + 64], 7); // initprot
+        LittleEndian::write_u32(&mut file[seg_off + 64..seg_off + 68], 0); // nsects
+        LittleEndian::write_u32(&mut file[seg_off + 68..seg_off + 72], 0); // flags
+
+        // LC_SYMTAB
+        let symtab_off = seg_off + 0x48;
+        LittleEndian::write_u32(&mut file[symtab_off..symtab_off + 4], 0x2);
+        LittleEndian::write_u32(&mut file[symtab_off + 4..symtab_off + 8], 0x18);
+        LittleEndian::write_u32(&mut file[symtab_off + 8..symtab_off + 12], 0);
+        LittleEndian::write_u32(&mut file[symtab_off + 12..symtab_off + 16], 0);
+        LittleEndian::write_u32(&mut file[symtab_off + 16..symtab_off + 20], 0);
+        LittleEndian::write_u32(&mut file[symtab_off + 20..symtab_off + 24], 0);
+
+        let data_start = 0x1000;
+        let name1_off = 0x20000;
+        let name2_off = 0x20040;
+        let name1_addr = BASE_ADDR + name1_off as u64;
+        let name2_addr = BASE_ADDR + name2_off as u64;
+
+        let name1_bytes = b"DevPacketData_GameServer_CharMoveStart_RQ\0";
+        let name2_bytes = b"DevPacketData_GameServer_CharMoveUpdate_RQ\0";
+        file[data_start + name1_off..data_start + name1_off + name1_bytes.len()]
+            .copy_from_slice(name1_bytes);
+        file[data_start + name2_off..data_start + name2_off + name2_bytes.len()]
+            .copy_from_slice(name2_bytes);
+
+        let packet1_off = data_start + (PACKET_ONE_ADDR - BASE_ADDR) as usize;
+        let packet2_off = data_start + (PACKET_TWO_ADDR - BASE_ADDR) as usize;
+
+        LittleEndian::write_u64(&mut file[packet1_off + 24..packet1_off + 32], name1_addr);
+        LittleEndian::write_u64(&mut file[packet1_off + 32..packet1_off + 40], 0);
+        LittleEndian::write_u32(&mut file[packet1_off + 40..packet1_off + 44], 0);
+
+        LittleEndian::write_u64(&mut file[packet2_off + 24..packet2_off + 32], name2_addr);
+        LittleEndian::write_u64(&mut file[packet2_off + 32..packet2_off + 40], 0);
+        LittleEndian::write_u32(&mut file[packet2_off + 40..packet2_off + 44], 0);
+
+        fs::write(path, file)?;
+        Ok(())
+    }
+
+    #[test]
+    fn loads_packets_from_testdata() -> anyhow::Result<()> {
+        let path = Path::new(TESTDATA_PATH);
+        write_macho_fixture(path)?;
+        let data = fs::read(path)?;
+        let mem = Mem::new(&data)?;
+
+        let (_, pkt1) = read_packet(&mem, PACKET_ONE_ADDR)?;
+        let (_, pkt2) = read_packet(&mem, PACKET_TWO_ADDR)?;
+
+        println!("Packet 1: {:?}", pkt1);
+        println!("Packet 2: {:?}", pkt2);
+
+        assert_eq!(pkt1.name, "DevPacketData_GameServer_CharMoveStart_RQ");
+        assert_eq!(pkt2.name, "DevPacketData_GameServer_CharMoveUpdate_RQ");
+        Ok(())
+    }
+}
