@@ -46,7 +46,7 @@ fn to_field_type(code: u32, subtype: Option<String>) -> FieldType {
             name: subtype.unwrap_or_default(),
             repr: None,
         },
-        44 => Bool,
+        76 => Bool,
         other => Unknown(other),
     }
 }
@@ -114,14 +114,37 @@ impl<'a> Mem<'a> {
                 name: seg_name,
             });
         }
-        let (addr2name, name2addr, data_symbols) = build_symbol_maps(&macho);
         Ok(Self {
+            data,
+            segments,
+            addr2name: HashMap::new(),
+            name2addr: HashMap::new(),
+            data_symbols: Vec::new(),
+        })
+    }
+
+    fn with_additional_symbols(
+        data: &'a [u8],
+        segments: Vec<SegmentInfo>,
+        mut data_symbols: Vec<(String, u64)>,
+        new_symbols: &[(String, u64)],
+    ) -> Self {
+        data_symbols.extend_from_slice(new_symbols);
+        let mut addr2name = HashMap::<u64, String>::new();
+        let mut name2addr = HashMap::<String, u64>::new();
+
+        for (name, addr) in &data_symbols {
+            addr2name.entry(*addr).or_insert_with(|| name.clone());
+            name2addr.entry(name.clone()).or_insert(*addr);
+        }
+
+        Self {
             data,
             segments,
             addr2name,
             name2addr,
             data_symbols,
-        })
+        }
     }
 
     fn vaddr_to_off(&self, vaddr: u64) -> Option<usize> {
@@ -190,30 +213,6 @@ fn parse_macho<'a>(data: &'a [u8]) -> Result<MachO<'a>, anyhow::Error> {
             }
         }
     })
-}
-
-fn build_symbol_maps(
-    macho: &MachO<'_>,
-) -> (
-    HashMap<u64, String>,
-    HashMap<String, u64>,
-    Vec<(String, u64)>,
-) {
-    let mut addr2name = HashMap::<u64, String>::new();
-    let mut name2addr = HashMap::<String, u64>::new();
-    let mut data_symbols = Vec::<(String, u64)>::new();
-    for sym in macho.symbols() {
-        let Ok((name, nlist)) = sym else { continue };
-        if name.is_empty() || nlist.n_value == 0 || nlist.is_undefined() || nlist.is_stab() {
-            continue;
-        }
-        let owned = name.to_owned();
-        let addr = nlist.n_value;
-        addr2name.entry(addr).or_insert_with(|| owned.clone());
-        name2addr.entry(owned.clone()).or_insert(addr);
-        data_symbols.push((owned, addr));
-    }
-    (addr2name, name2addr, data_symbols)
 }
 
 fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error> {
@@ -285,7 +284,7 @@ fn collapse_fields(fields: Vec<Field>) -> Vec<Field> {
     out
 }
 
-fn read_enum(mem: &Mem, entry: u64) -> Option<EnumDef> {
+fn read_enum(mem: &Mem, entry: u64) -> Option<(u64, EnumDef)> {
     let hdr = mem.read_bytes(entry, 56).ok()?;
 
     // Verify padding (Offset 8) is 0
@@ -329,16 +328,16 @@ fn read_enum(mem: &Mem, entry: u64) -> Option<EnumDef> {
 
     for i in 0..field_cnt {
         let p = i * 16;
-        
+
         // Field Name Pointer
         let fname_ptr_raw = LittleEndian::read_u64(&blob[p..p + 8]);
         let fname_ptr = fixup_pointer(fname_ptr_raw);
-        
+
         // Field Value
         let value = LittleEndian::read_u64(&blob[p + 8..p + 16]);
-        
+
         let mut fname = mem.get_ascii_string(fname_ptr).ok()?;
-        
+
         // Strip "EnumName::" prefix if present
         if let Some(stripped) = fname.strip_prefix(&format!("{}::", name)) {
             fname = stripped.to_owned();
@@ -356,7 +355,7 @@ fn read_enum(mem: &Mem, entry: u64) -> Option<EnumDef> {
     }
     .to_owned();
 
-    Some(EnumDef { name, repr, fields })
+    Some((entry, EnumDef { name, repr, fields }))
 }
 
 fn read_fields(mem: &Mem, arr_ptr: u64, count: usize) -> anyhow::Result<Vec<Field>> {
@@ -432,7 +431,7 @@ fn clean_uobject_sym(sym: &str) -> String {
 }
 
 fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
-    let rec = mem.read_bytes(field_addr, 0x38)?;
+    let rec = mem.read_bytes(field_addr, 0x40)?;
     let s_name_raw = LittleEndian::read_u64(&rec[0..8]);
     let s_name = fixup_pointer(s_name_raw);
     let unk1 = LittleEndian::read_u64(&rec[8..16]);
@@ -441,32 +440,46 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
     let f_type = LittleEndian::read_u32(&rec[24..28]);
     let unk4 = LittleEndian::read_u32(&rec[28..32]);
     let unk5 = LittleEndian::read_u32(&rec[32..36]);
-    let raw_offset = LittleEndian::read_u32(&rec[36..40]);
-    let func_desc_raw = LittleEndian::read_u64(&rec[40..48]);
-    let func_desc = fixup_pointer(func_desc_raw);
-    let func_desc1 = LittleEndian::read_u64(&rec[48..56]); // code pointer — no fixup
+    let raw_offset = LittleEndian::read_u32(&rec[50..54]);
+    let func_desc1 = LittleEndian::read_u64(&rec[48..56]);
+    //
+    let lazy_func_ptr_raw = LittleEndian::read_u64(&rec[56..64]);
+    let lazy_func_ptr = fixup_pointer(lazy_func_ptr_raw);
 
     let name = mem.get_ascii_string(s_name)?;
 
     let (offset, ty_name_opt) = match f_type {
-        25 | 30 => {
-            let ty_name = mem.addr2name.get(&func_desc).cloned();
-            (raw_offset, ty_name)
+        25 => {
+            let ty_name = resolve_lazy_object(&mem, lazy_func_ptr);
+            if let Some(a) = ty_name {
+                println!("{:X} {:X} {:?}", raw_offset, a, mem.addr2name.get(&a));
+            }
+            let n = ty_name.and_then(|a| mem.addr2name.get(&a));
+            (raw_offset, n)
         }
-        44 => {
-            let off = arm64_store_imm(mem, func_desc1 + 4).unwrap_or(0);
+        30 => {
+            let ty_name = resolve_lazy_object(&mem, lazy_func_ptr);
+            if let Some(a) = ty_name {
+                println!("{:X} {:X} {:?}", raw_offset, a, mem.addr2name.get(&a));
+            }
+            
+            let n = ty_name.and_then(|a| mem.addr2name.get(&a));
+            (raw_offset, n)
+        }
+        76 => {
+            let off = arm64_store_imm(mem, lazy_func_ptr + 4).unwrap_or(0xffff);
             (off, None)
         }
         _ => (raw_offset, None),
     };
 
-    let f_type = to_field_type(f_type, ty_name_opt.clone());
+    let f_type = to_field_type(f_type, ty_name_opt.clone().cloned());
 
     Ok(Field {
         name,
         f_type,
         offset,
-        ty_ptr: ty_name_opt,
+        ty_ptr: ty_name_opt.cloned(),
         unk1,
         unk2,
         unk3,
@@ -475,8 +488,110 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
     })
 }
 
-fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<EnumDef> {
-    let mut map = BTreeMap::<String, EnumDef>::new();
+fn resolve_lazy_object(mem: &Mem, func_ptr: u64) -> Option<u64> {
+    use capstone::arch::arm64::Arm64Reg::*;
+
+    // 1. Disassemble the wrapper function to find the lazy init call
+    let code_len = 64; // Wrapper is usually small
+    let code = mem.read_bytes(func_ptr, code_len).ok()?;
+    let cs = Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .detail(true)
+        .build()
+        .ok()?;
+
+    let insns = cs.disasm_all(code, func_ptr).ok()?;
+    let mut target_func = 0;
+
+    for insn in insns.iter() {
+        if insn.id().0 == Arm64Insn::ARM64_INS_CBZ as u32 {
+            let detail = cs.insn_detail(insn).ok()?;
+            let arch = detail.arch_detail();
+            let arm64 = arch.arm64()?;
+            for op in arm64.operands() {
+                if let Arm64OperandType::Imm(imm) = op.op_type {
+                    target_func = imm as u64;
+                    break;
+                }
+            }
+        }
+    }
+
+    if target_func == 0 {
+        return None;
+    }
+
+    // 2. Disassemble the init function (FUN_106877920)
+    // Find the "adrp xN, ... add xN, xN, ..." pattern for arguments (x0-x7).
+
+    let code = mem.read_bytes(target_func, 256).ok()?;
+    let insns = cs.disasm_all(code, target_func).ok()?;
+
+    // Store known ADRP bases for registers [x0..x30]. 32 slots for x0-x30, plus sp, etc.
+    // We only care about x0..x30 (index 0..30)
+    // We map register ID (u32) to the ADRP page base (i64)
+    let mut reg_pages = HashMap::<u32, i64>::new();
+
+    for insn in insns.iter() {
+        let id = insn.id().0;
+
+        if id == Arm64Insn::ARM64_INS_BL as u32 || id == Arm64Insn::ARM64_INS_RET as u32 {
+            break;
+        }
+
+        let detail = cs.insn_detail(insn).ok()?;
+        let arch = detail.arch_detail();
+        let arm64 = arch.arm64()?;
+        let ops: Vec<_> = arm64.operands().collect();
+
+        if id == Arm64Insn::ARM64_INS_ADRP as u32 {
+            // Check if there are 2 operands (Reg, Imm)
+            if ops.len() == 2 {
+                if let (Arm64OperandType::Reg(reg), Arm64OperandType::Imm(imm)) =
+                    (ops[0].op_type.clone(), ops[1].op_type.clone())
+                {
+                    reg_pages.insert(reg.0.into(), imm);
+                }
+            }
+        } else if id == Arm64Insn::ARM64_INS_ADD as u32 {
+            // Check if there are 3 operands (Reg, Reg, Imm)
+            // Pattern: add Dst, Src, #Imm
+            if ops.len() >= 3 {
+                if let (
+                    Arm64OperandType::Reg(dst),
+                    Arm64OperandType::Reg(src),
+                    Arm64OperandType::Imm(imm),
+                ) = (
+                    ops[0].op_type.clone(),
+                    ops[1].op_type.clone(),
+                    ops[2].op_type.clone(),
+                ) {
+                    // Ensure Dst == Src (e.g., add x1, x1, #0xd10)
+                    if dst == src {
+                        // Check if we have a page base for the source register
+                        if let Some(&page_base) = reg_pages.get(&src.0.into()) {
+                            let final_addr = (page_base as u64).wrapping_add(imm as u64);
+
+                            // HEURISTIC: Prioritize argument registers x0..x7 (ID 1-8 in Capstone internal enum).
+                            // A better check is based on the register ID defined in the capstone/arm64 module.
+                            if u32::from(src.0) >= ARM64_REG_X0 as u32
+                                && u32::from(src.0) <= ARM64_REG_X7 as u32
+                            {
+                                return Some(final_addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<(u64, EnumDef)> {
+    let mut map = BTreeMap::<String, (u64, EnumDef)>::new();
 
     // Ensure the source we are looking for is in the "fixed" format
     let target_source = fixup_pointer(common_source);
@@ -520,8 +635,9 @@ fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<EnumDef> {
             // DEBUG: Print candidate address
             println!("[DEBUG] Enum Candidate found at {:#x}", addr);
 
-            if let Some(e) = read_enum(mem, addr) {
-                map.entry(e.name.clone()).or_insert(e);
+            if let Some((addr, e)) = read_enum(mem, addr) {
+                // Store the (addr, EnumDef) tuple
+                map.entry(e.name.clone()).or_insert((addr, e));
             }
         }
     }
@@ -534,7 +650,6 @@ fn scan_all_segments_for_packets_and_structs(
     let mut packets = Vec::new();
     let mut structs = Vec::new();
     let common_source = 0x0000_0001_05d1_f850u64;
-    let packet_prologue = 0x0000_0001_060b_1e68u64; // Update if needed for your binary
 
     for seg in &mem.segments {
         if seg.filesize <= 16 {
@@ -580,8 +695,18 @@ fn main() -> Result<(), anyhow::Error> {
     let mem = Mem::new(&map)?;
 
     let common_source = 0x0000_0001_05d1_f850u64;
-    let enums = scan_for_enums(&mem, common_source);
-    println!("Found {} enums", enums.len());
+    let enums_with_addr = scan_for_enums(&mem, common_source);
+    println!("Found {} enums", enums_with_addr.len());
+
+    let mut new_symbols: Vec<(String, u64)> = Vec::new();
+    let mut enums = Vec::new();
+    for (addr, e) in enums_with_addr {
+        let clean_name = clean_uobject_sym(&e.name);
+        new_symbols.push((clean_name, addr));
+        enums.push(e);
+    }
+
+    let mem = Mem::with_additional_symbols(mem.data, mem.segments, new_symbols, &vec![]);
 
     let (mut packets, mut structs) = scan_all_segments_for_packets_and_structs(&mem)?;
     println!(
