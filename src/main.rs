@@ -441,8 +441,6 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
     let unk4 = LittleEndian::read_u32(&rec[28..32]);
     let unk5 = LittleEndian::read_u32(&rec[32..36]);
     let raw_offset = LittleEndian::read_u32(&rec[50..54]);
-    let func_desc1 = LittleEndian::read_u64(&rec[48..56]);
-    //
     let lazy_func_ptr_raw = LittleEndian::read_u64(&rec[56..64]);
     let lazy_func_ptr = fixup_pointer(lazy_func_ptr_raw);
 
