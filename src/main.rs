@@ -1,6 +1,7 @@
 use anyhow::Context;
 use byteorder::{ByteOrder, LittleEndian};
 use capstone::arch;
+use capstone::arch::arm64::Arm64Reg;
 use capstone::arch::arm64::{Arm64Insn, Arm64OperandType};
 use capstone::prelude::*;
 use goblin::Object;
@@ -60,6 +61,7 @@ struct EnumDef {
 #[derive(Debug, Serialize)]
 struct PacketInfo {
     name: String,
+    opcode: Option<u32>, // <--- Added this field
     mem_size: u64,
     flags: u64,
     fields: Vec<Field>,
@@ -220,13 +222,20 @@ fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error
     let s_name = fixup_pointer(s_name_raw);
     let name = mem.get_ascii_string(s_name)?;
 
-    //let u_size = LittleEndian::read_u64(&rec[32..40]);
-    //let u_flags = LittleEndian::read_u64(&rec[40..48]);
     let p_fields_raw = LittleEndian::read_u64(&rec[32..40]);
     let p_fields = fixup_pointer(p_fields_raw);
     let field_cnt = LittleEndian::read_u32(&rec[40..44]) as usize;
 
-    println!("{} {:X} {:X} {:X}", name, entry, p_fields, field_cnt);
+    // Try to find opcode if it looks like a packet
+    let opcode = if name.starts_with("DevPacket") || name.ends_with("Data") {
+        find_packet_opcode(mem, entry)
+    } else {
+        None
+    };
+
+    if let Some(op) = opcode {
+        println!("{} found opcode: {:#x}", name, op);
+    }
 
     let fields = read_fields(mem, p_fields, field_cnt & 0xffff)?;
     let mut fields = collapse_fields(fields);
@@ -236,6 +245,7 @@ fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error
         entry,
         PacketInfo {
             name,
+            opcode, // <--- Store it
             mem_size: 0,
             flags: 0,
             fields,
@@ -277,10 +287,13 @@ fn collapse_fields(fields: Vec<Field>) -> Vec<Field> {
 
 fn read_enum(mem: &Mem, entry: u64) -> Option<EnumDef> {
     let hdr = mem.read_bytes(entry, 56).ok()?;
+
+    // Verify padding (Offset 8) is 0
     if LittleEndian::read_u64(&hdr[8..16]) != 0 {
         return None;
     }
 
+    // Read Name pointers
     let name_ptr_raw = LittleEndian::read_u64(&hdr[16..24]);
     let name_dup_raw = LittleEndian::read_u64(&hdr[24..32]);
     let name_ptr = fixup_pointer(name_ptr_raw);
@@ -290,24 +303,43 @@ fn read_enum(mem: &Mem, entry: u64) -> Option<EnumDef> {
         return None;
     }
 
+    println!("name: {:X}", name_dup);
+
+    // Read Fields Array Pointer (Offset 32)
     let fields_ptr_raw = LittleEndian::read_u64(&hdr[32..40]);
     let fields_ptr = fixup_pointer(fields_ptr_raw);
-    let field_cnt = LittleEndian::read_u32(&hdr[40..44]) as usize;
 
-    if LittleEndian::read_u64(&hdr[44..52]) != 0x45 {
+    // Read Magic and Count (Offsets 40 and 44)
+    // Based on dump: Magic is at 40, Count is at 44
+    let magic = LittleEndian::read_u32(&hdr[40..44]);
+    let field_cnt = (LittleEndian::read_u32(&hdr[44..48]) & 0xffff) as usize;
+
+    println!("magic: {} field_cnt: {}", magic, field_cnt);
+
+    // Verify Magic 'E' (0x45)
+    if magic != 0x45 {
         return None;
     }
 
     let name = mem.get_ascii_string(name_ptr).ok()?;
+
+    // Parse Fields
     let blob = mem.read_bytes(fields_ptr, field_cnt * 16).ok()?;
     let mut fields = Vec::with_capacity(field_cnt);
 
     for i in 0..field_cnt {
         let p = i * 16;
+        
+        // Field Name Pointer
         let fname_ptr_raw = LittleEndian::read_u64(&blob[p..p + 8]);
         let fname_ptr = fixup_pointer(fname_ptr_raw);
+        
+        // Field Value
         let value = LittleEndian::read_u64(&blob[p + 8..p + 16]);
+        
         let mut fname = mem.get_ascii_string(fname_ptr).ok()?;
+        
+        // Strip "EnumName::" prefix if present
         if let Some(stripped) = fname.strip_prefix(&format!("{}::", name)) {
             fname = stripped.to_owned();
         }
@@ -352,7 +384,10 @@ fn arm64_store_imm(mem: &Mem, addr: u64) -> anyhow::Result<u32> {
         .detail(true)
         .build()?;
     let insns = cs.disasm_all(bytes, addr)?;
-    let insn = insns.iter().next().ok_or_else(|| anyhow::anyhow!("no insn"))?;
+    let insn = insns
+        .iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no insn"))?;
 
     match insn.id().0 {
         id if id == Arm64Insn::ARM64_INS_STR as u32
@@ -361,7 +396,9 @@ fn arm64_store_imm(mem: &Mem, addr: u64) -> anyhow::Result<u32> {
         {
             let detail = cs.insn_detail(&insn)?;
             let arch_detail = detail.arch_detail();
-            let arch = arch_detail.arm64().ok_or_else(|| anyhow::anyhow!("no arm64 detail"))?;
+            let arch = arch_detail
+                .arm64()
+                .ok_or_else(|| anyhow::anyhow!("no arm64 detail"))?;
             for op in arch.operands() {
                 if let Arm64OperandType::Mem(ref m) = op.op_type {
                     return Ok(m.disp() as u32);
@@ -440,6 +477,10 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
 
 fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<EnumDef> {
     let mut map = BTreeMap::<String, EnumDef>::new();
+
+    // Ensure the source we are looking for is in the "fixed" format
+    let target_source = fixup_pointer(common_source);
+
     for seg in &mem.segments {
         if seg.filesize == 0 {
             continue;
@@ -451,23 +492,34 @@ fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<EnumDef> {
         }
         let seg_slice = &mem.data[start..end];
         let base = seg.vmaddr;
-        let upper = seg_slice.len().saturating_sub(40);
+        let upper = seg_slice.len().saturating_sub(56); // Ensure space for full header
 
         for off in (0..upper).step_by(8) {
-            let q0 = LittleEndian::read_u64(&seg_slice[off..off + 8]);
-            if q0 != common_source {
+            // 1. Check Source Pointer (Offset 0)
+            let q0_raw = LittleEndian::read_u64(&seg_slice[off..off + 8]);
+            if fixup_pointer(q0_raw) != target_source {
                 continue;
             }
+
+            // 2. Check Padding (Offset 8) - Must be 0
             let q1 = LittleEndian::read_u64(&seg_slice[off + 8..off + 16]);
             if q1 != 0 {
                 continue;
             }
-            let q3 = LittleEndian::read_u64(&seg_slice[off + 16..off + 24]);
-            let q4 = LittleEndian::read_u64(&seg_slice[off + 24..off + 32]);
-            if q3 != q4 {
+
+            // 3. Check Name Pointer vs Name Duplicate (Offset 16 & 24)
+            let name_ptr_raw = LittleEndian::read_u64(&seg_slice[off + 16..off + 24]);
+            let name_dup_raw = LittleEndian::read_u64(&seg_slice[off + 24..off + 32]);
+
+            if fixup_pointer(name_ptr_raw) != fixup_pointer(name_dup_raw) {
                 continue;
             }
+
             let addr = base + off as u64;
+
+            // DEBUG: Print candidate address
+            println!("[DEBUG] Enum Candidate found at {:#x}", addr);
+
             if let Some(e) = read_enum(mem, addr) {
                 map.entry(e.name.clone()).or_insert(e);
             }
@@ -505,11 +557,9 @@ fn scan_all_segments_for_packets_and_structs(
             }
             let q1 = LittleEndian::read_u64(&slice[off + 8..off + 16]);
 
-            
-                if let Ok((_, cls)) = read_packet(&mem, addr) {
-                    structs.push(cls);
-                }
-            
+            if let Ok((_, cls)) = read_packet(&mem, addr) {
+                structs.push(cls);
+            }
         }
     }
 
@@ -709,5 +759,145 @@ mod tests {
         assert_eq!(pkt1.name, "DevPacketData_GameServer_CharMoveStart_RQ");
         assert_eq!(pkt2.name, "DevPacketData_GameServer_CharMoveUpdate_RQ");
         Ok(())
+    }
+}
+
+/// Follows the constructor chain to find the opcode.
+/// Logic:
+/// 1. Entry + 16 -> FuncA
+/// 2. FuncA -> finding 'str x8, [x0]' (where x8 is calculated via adrp/add) -> VTable1
+/// 3. VTable1 + 24 -> FuncB
+/// 4. FuncB -> finding 'stp x8, x9, [x1]' (where x8 is calculated) -> VTable2
+/// 5. VTable2 + 16 -> FuncOpcode
+/// 6. FuncOpcode -> 'mov w0, #imm' -> Opcode
+fn find_packet_opcode(mem: &Mem, entry: u64) -> Option<u32> {
+    // 1. Read 3rd pointer (offset 16)
+    let func_a_ptr = fixup_pointer(mem.read_u64(entry + 16).ok()?);
+
+    // 2. Disasm FuncA to find VTable1.
+    // The trace shows the result is stored in [x0].
+    let vtable1_ptr = scan_for_vtable_ptr(mem, func_a_ptr, Arm64Reg::ARM64_REG_X0)?;
+
+    // 3. Read 4th pointer (offset 24) from VTable1
+    let func_b_ptr = fixup_pointer(mem.read_u64(vtable1_ptr + 24).ok()?);
+
+    // 4. Disasm FuncB to find VTable2.
+    // The trace shows the result is stored in [x1] (via stp x8, x9, [x1]).
+    let vtable2_ptr = scan_for_vtable_ptr(mem, func_b_ptr, Arm64Reg::ARM64_REG_X1)?;
+
+    // 5. Read 3rd pointer (offset 16) from VTable2
+    let opcode_func = fixup_pointer(mem.read_u64(vtable2_ptr + 16).ok()?);
+
+    // 6. Disasm OpcodeFunc to find 'mov w0, IMM'
+    scan_return_imm(mem, opcode_func)
+}
+
+// FIX: Changed store_target_reg type to u32
+fn scan_for_vtable_ptr(mem: &Mem, func_addr: u64, store_target_reg: u32) -> Option<u64> {
+    let code = mem.read_bytes(func_addr, 128).ok()?;
+    let cs = Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .detail(true)
+        .build()
+        .ok()?;
+
+    let insns = cs.disasm_all(code, func_addr).ok()?;
+    let mut reg_vals = HashMap::<u32, u64>::new();
+
+    for insn in insns.iter() {
+        let detail = cs.insn_detail(&insn).ok()?;
+        let arch = detail.arch_detail();
+        // Collect iterator into a Vec so we can index it
+        let ops: Vec<_> = arch.arm64()?.operands().collect();
+        let id = insn.id().0;
+
+        if id == Arm64Insn::ARM64_INS_ADRP as u32 {
+            if ops.len() >= 2 {
+                if let (Some(dest), Some(imm)) = (get_reg(&ops[0]), get_imm(&ops[1])) {
+                    reg_vals.insert(dest, imm as u64);
+                }
+            }
+        } else if id == Arm64Insn::ARM64_INS_ADD as u32 {
+            if ops.len() >= 3 {
+                if let (Some(dest), Some(src), Some(imm)) =
+                    (get_reg(&ops[0]), get_reg(&ops[1]), get_imm(&ops[2]))
+                {
+                    if let Some(base) = reg_vals.get(&src) {
+                        reg_vals.insert(dest, base.wrapping_add(imm as u64));
+                    }
+                }
+            }
+        } else if id == Arm64Insn::ARM64_INS_STR as u32 || id == Arm64Insn::ARM64_INS_STP as u32 {
+            for op in &ops {
+                if let Arm64OperandType::Mem(m) = op.op_type {
+                    // FIX: Compare u32 directly
+                    if m.base().0 as u32 == store_target_reg {
+                        if let Some(src_reg_code) = get_reg(&ops[0]) {
+                            if let Some(val) = reg_vals.get(&src_reg_code) {
+                                return Some(*val);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if id == Arm64Insn::ARM64_INS_RET as u32 || id == Arm64Insn::ARM64_INS_B as u32 {
+            break;
+        }
+    }
+    None
+}
+
+fn scan_return_imm(mem: &Mem, func_addr: u64) -> Option<u32> {
+    let code = mem.read_bytes(func_addr, 32).ok()?;
+    let cs = Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .detail(true)
+        .build()
+        .ok()?;
+
+    let insns = cs.disasm_all(code, func_addr).ok()?;
+
+    for insn in insns.iter() {
+        let detail = cs.insn_detail(&insn).ok()?;
+        let arch = detail.arch_detail();
+        // FIX: Collect iterator into a Vec
+        let ops: Vec<_> = arch.arm64()?.operands().collect();
+        let id = insn.id().0;
+
+        if id == Arm64Insn::ARM64_INS_MOV as u32 || id == Arm64Insn::ARM64_INS_MOVZ as u32 {
+            if ops.len() >= 2 {
+                if let (Some(dest), Some(imm)) = (get_reg(&ops[0]), get_imm(&ops[1])) {
+                    if dest == Arm64Reg::ARM64_REG_W0 as u32
+                        || dest == Arm64Reg::ARM64_REG_X0 as u32
+                    {
+                        return Some(imm as u32);
+                    }
+                }
+            }
+        }
+        if id == Arm64Insn::ARM64_INS_RET as u32 {
+            break;
+        }
+    }
+    None
+}
+
+// Helper to extract register ID
+fn get_reg(op: &capstone::arch::arm64::Arm64Operand) -> Option<u32> {
+    if let Arm64OperandType::Reg(r) = op.op_type {
+        Some(r.0 as u32)
+    } else {
+        None
+    }
+}
+
+// Helper to extract Immediate
+fn get_imm(op: &capstone::arch::arm64::Arm64Operand) -> Option<i64> {
+    if let Arm64OperandType::Imm(i) = op.op_type {
+        Some(i)
+    } else {
+        None
     }
 }
