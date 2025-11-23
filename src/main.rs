@@ -15,6 +15,13 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum SubType {
+    None,
+    Unresolved(u64),
+    Resolved(u64, String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum FieldType {
     U8,
     I32,
@@ -23,16 +30,17 @@ pub enum FieldType {
     StringUtf16,
     Bool,
     Array(Box<FieldType>),
-    Struct(String),
+    Map(Box<FieldType>, Box<FieldType>),
+    Struct(SubType),
     Enum {
-        name: String,
+        name: SubType,
         repr: Option<Box<FieldType>>,
     },
     Unresolved,
     Unknown(u32),
 }
 
-fn to_field_type(code: u32, subtype: Option<String>) -> FieldType {
+fn to_field_type(code: u32, subtype: SubType) -> FieldType {
     use FieldType::*;
     match code {
         0 => U8,
@@ -41,9 +49,10 @@ fn to_field_type(code: u32, subtype: Option<String>) -> FieldType {
         10 => F32,
         21 => StringUtf16,
         22 => Array(Box::new(Unresolved)),
-        25 => Struct(subtype.unwrap_or_default()),
+        23 => Map(Box::new(Unresolved), Box::new(Unresolved)),
+        25 => Struct(subtype),
         30 => Enum {
-            name: subtype.unwrap_or_default(),
+            name: subtype,
             repr: None,
         },
         76 => Bool,
@@ -56,15 +65,17 @@ struct EnumDef {
     name: String,
     repr: String,
     fields: Vec<(String, u64)>,
+    vaddr: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct PacketInfo {
     name: String,
-    opcode: Option<u32>, // <--- Added this field
+    opcode: Option<u32>,
     mem_size: u64,
     flags: u64,
     fields: Vec<Field>,
+    vaddr: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,7 +83,7 @@ struct Field {
     name: String,
     f_type: FieldType,
     offset: u32,
-    ty_ptr: Option<String>,
+    ty_ptr: SubType,
     unk1: u64,
     unk2: u32,
     unk3: u32,
@@ -232,11 +243,14 @@ fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error
         None
     };
 
-    if let Some(op) = opcode {
-        println!("{} found opcode: {:#x}", name, op);
-    }
+    //if let Some(op) = opcode {
+    //    println!("{} found opcode: {:#x}", name, op);
+    //}
 
     let fields = read_fields(mem, p_fields, field_cnt & 0xffff)?;
+    if name == "DevPacketData_Common_BattlePassGroupInfo" {
+        println!("{:?}", fields);
+    }
     let mut fields = collapse_fields(fields);
     fields.sort_by_key(|f| f.offset);
 
@@ -244,44 +258,269 @@ fn read_packet(mem: &Mem, entry: u64) -> Result<(u64, PacketInfo), anyhow::Error
         entry,
         PacketInfo {
             name,
-            opcode, // <--- Store it
+            opcode,
             mem_size: 0,
             flags: 0,
             fields,
+            // ADD THIS LINE
+            vaddr: entry,
         },
     ))
 }
 
 fn collapse_fields(fields: Vec<Field>) -> Vec<Field> {
-    let mut out = Vec::with_capacity(fields.len());
+    // Pass 1: Collapse Enums (Enum + UnderlyingType)
+    let mut with_enums = Vec::with_capacity(fields.len());
     let mut i = 0;
     while i < fields.len() {
-        let mut cur = fields[i].clone();
-        if cur.name == "UnderlyingType" && i + 1 < fields.len() {
-            if let FieldType::Enum { .. } = fields[i + 1].f_type {
-                let mut enum_field = fields[i + 1].clone();
-                if let FieldType::Enum { ref mut repr, .. } = enum_field.f_type {
-                    *repr = Some(Box::new(cur.f_type.clone()));
+        let cur = &fields[i];
+
+        if matches!(cur.f_type, FieldType::Enum { .. }) {
+            if i + 1 < fields.len() && fields[i + 1].name == "UnderlyingType" {
+                let mut merged = cur.clone();
+                if let FieldType::Enum { ref mut repr, .. } = merged.f_type {
+                    *repr = Some(Box::new(fields[i + 1].f_type.clone()));
                 }
-                out.push(enum_field);
+                with_enums.push(merged);
                 i += 2;
                 continue;
             }
         }
-        if matches!(cur.f_type, FieldType::Array(_))
-            && !out.is_empty()
-            && out.last().unwrap().name == cur.name
-        {
-            let element = out.pop().unwrap();
-            cur.f_type = FieldType::Array(Box::new(element.f_type.clone()));
-            out.push(cur);
-            i += 1;
-            continue;
-        }
-        out.push(cur);
+        with_enums.push(cur.clone());
         i += 1;
     }
+
+    // Pass 2: Collapse Maps (Map + Key + Value)
+    // Pattern: [MapContainer, KeyField (name_Key), ValueField (name)]
+    let mut with_maps = Vec::with_capacity(with_enums.len());
+    i = 0;
+    while i < with_enums.len() {
+        let cur = &with_enums[i];
+
+        if matches!(cur.f_type, FieldType::Map(_, _)) {
+            // Check for the Key and Value fields
+            if i + 2 < with_enums.len() {
+                let key_field = &with_enums[i + 1];
+                let val_field = &with_enums[i + 2];
+                let expected_key_name = format!("{}_Key", cur.name);
+
+                // Verify Naming convention:
+                // 1. Key name is "Name_Key"
+                // 2. Value name is "Name" (same as container)
+                if key_field.name == expected_key_name && val_field.name == cur.name {
+                    let mut merged = cur.clone();
+                    merged.f_type = FieldType::Map(
+                        Box::new(key_field.f_type.clone()),
+                        Box::new(val_field.f_type.clone()),
+                    );
+                    with_maps.push(merged);
+                    i += 3; // Skip Map, Key, and Value fields
+                    continue;
+                }
+            }
+        }
+        with_maps.push(cur.clone());
+        i += 1;
+    }
+
+    // Pass 3: Collapse Arrays (Array + Element with same name)
+    // Note: Use `with_maps` as input now
+    let mut out = Vec::with_capacity(with_maps.len());
+    i = 0;
+    while i < with_maps.len() {
+        let cur = &with_maps[i];
+
+        if matches!(cur.f_type, FieldType::Array(_)) {
+            if i + 1 < with_maps.len() && with_maps[i + 1].name == cur.name {
+                let mut merged = cur.clone();
+                merged.f_type = FieldType::Array(Box::new(with_maps[i + 1].f_type.clone()));
+                out.push(merged);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(cur.clone());
+        i += 1;
+    }
+
     out
+}
+
+#[test]
+fn test_collapse_fields_map() {
+    let make_field = |name: &str, f_type: FieldType, offset: u32| Field {
+        name: name.to_string(),
+        f_type,
+        offset,
+        ty_ptr: SubType::None,
+        unk1: 0,
+        unk2: 0,
+        unk3: 0,
+        unk4: 0,
+        unk5: 0,
+    };
+
+    let input = vec![
+        // --- Map Case 1: _repeat_reward_exp_list (Map<I32, I32>) ---
+        // 1. Container (Type 23)
+        make_field(
+            "_repeat_reward_exp_list",
+            FieldType::Map(
+                Box::new(FieldType::Unresolved),
+                Box::new(FieldType::Unresolved),
+            ),
+            136,
+        ),
+        // 2. Key
+        make_field("_repeat_reward_exp_list_Key", FieldType::I32, 0),
+        // 3. Value
+        make_field("_repeat_reward_exp_list", FieldType::I32, 1),
+        // --- Map Case 2: _rewarded_level_list (Map<I32, U8>) ---
+        // 1. Container
+        make_field(
+            "_rewarded_level_list",
+            FieldType::Map(
+                Box::new(FieldType::Unresolved),
+                Box::new(FieldType::Unresolved),
+            ),
+            56,
+        ),
+        // 2. Key
+        make_field("_rewarded_level_list_Key", FieldType::I32, 0),
+        // 3. Value
+        make_field("_rewarded_level_list", FieldType::U8, 1),
+        // --- Array Case (to ensure order is correct) ---
+        // 1. Array Container
+        make_field(
+            "_battle_pass_list",
+            FieldType::Array(Box::new(FieldType::Unresolved)),
+            40,
+        ),
+        // 2. Array Element
+        make_field("_battle_pass_list", FieldType::I32, 0),
+    ];
+
+    let collapsed = collapse_fields(input);
+
+    assert_eq!(collapsed.len(), 3);
+
+    // Verify Map 1
+    let map1 = &collapsed[0];
+    assert_eq!(map1.name, "_repeat_reward_exp_list");
+    if let FieldType::Map(k, v) = &map1.f_type {
+        assert_eq!(**k, FieldType::I32);
+        assert_eq!(**v, FieldType::I32);
+    } else {
+        panic!("First field should be Map");
+    }
+
+    // Verify Map 2
+    let map2 = &collapsed[1];
+    assert_eq!(map2.name, "_rewarded_level_list");
+    if let FieldType::Map(k, v) = &map2.f_type {
+        assert_eq!(**k, FieldType::I32);
+        assert_eq!(**v, FieldType::U8);
+    } else {
+        panic!("Second field should be Map");
+    }
+
+    // Verify Array
+    let arr = &collapsed[2];
+    assert_eq!(arr.name, "_battle_pass_list");
+    if let FieldType::Array(inner) = &arr.f_type {
+        assert_eq!(**inner, FieldType::I32);
+    } else {
+        panic!("Third field should be Array");
+    }
+}
+
+#[test]
+fn test_collapse_fields_complex() {
+    // Helper to construct a dummy field for the test
+    let make_field = |name: &str, f_type: FieldType, offset: u32| Field {
+        name: name.to_string(),
+        f_type,
+        offset,
+        ty_ptr: SubType::None,
+        unk1: 0,
+        unk2: 0,
+        unk3: 1048576,
+        unk4: 69,
+        unk5: 0,
+    };
+
+    let input = vec![
+        // 0: Unknown
+        make_field("AbnormalEffectLvGroupId", FieldType::Unknown(20), 48),
+        // 1: Array Wrapper
+        make_field(
+            "Values",
+            FieldType::Array(Box::new(FieldType::Unresolved)),
+            32,
+        ),
+        // 2: Array Element (String)
+        make_field("Values", FieldType::StringUtf16, 0),
+        // 3: Enum Wrapper
+        make_field(
+            "AbnormalEffectType",
+            FieldType::Enum {
+                name: SubType::Unresolved(4502911376),
+                repr: None,
+            },
+            24,
+        ),
+        // 4: Enum Underlying Type
+        make_field("UnderlyingType", FieldType::U8, 0),
+        // 5: Unknown
+        make_field("AbnormalEffectFx", FieldType::Unknown(20), 16),
+        // 6: Struct
+        make_field(
+            "AbnormalId",
+            FieldType::Struct(SubType::Unresolved(4500015504)),
+            12,
+        ),
+        // 7: Struct
+        make_field("Id", FieldType::Struct(SubType::Unresolved(4500015504)), 8),
+    ];
+
+    let collapsed = collapse_fields(input);
+
+    // Expectation:
+    // 1. "Values" (String) merged into "Values" (Array)
+    // 2. "UnderlyingType" merged into "AbnormalEffectType"
+    // Total fields reduced from 8 to 6
+    assert_eq!(collapsed.len(), 6);
+
+    // Verify Array Collapse
+    let values_field = collapsed.iter().find(|f| f.name == "Values").unwrap();
+    if let FieldType::Array(inner) = &values_field.f_type {
+        assert_eq!(**inner, FieldType::StringUtf16);
+    } else {
+        panic!("Expected Values to be an Array");
+    }
+
+    // Verify Enum Collapse
+    let enum_field = collapsed
+        .iter()
+        .find(|f| f.name == "AbnormalEffectType")
+        .unwrap();
+    if let FieldType::Enum { repr, .. } = &enum_field.f_type {
+        assert_eq!(
+            **repr.as_ref().unwrap(),
+            FieldType::U8,
+            "Enum repr should be U8"
+        );
+    } else {
+        panic!("Expected AbnormalEffectType to be an Enum");
+    }
+
+    // Verify UnderlyingType is gone
+    assert!(
+        collapsed
+            .iter()
+            .find(|f| f.name == "UnderlyingType")
+            .is_none()
+    );
 }
 
 fn read_enum(mem: &Mem, entry: u64) -> Option<(u64, EnumDef)> {
@@ -302,7 +541,7 @@ fn read_enum(mem: &Mem, entry: u64) -> Option<(u64, EnumDef)> {
         return None;
     }
 
-    println!("name: {:X}", name_dup);
+    //println!("name: {:X}", name_dup);
 
     // Read Fields Array Pointer (Offset 32)
     let fields_ptr_raw = LittleEndian::read_u64(&hdr[32..40]);
@@ -313,7 +552,7 @@ fn read_enum(mem: &Mem, entry: u64) -> Option<(u64, EnumDef)> {
     let magic = LittleEndian::read_u32(&hdr[40..44]);
     let field_cnt = (LittleEndian::read_u32(&hdr[44..48]) & 0xffff) as usize;
 
-    println!("magic: {} field_cnt: {}", magic, field_cnt);
+    //println!("magic: {} field_cnt: {}", magic, field_cnt);
 
     // Verify Magic 'E' (0x45)
     if magic != 0x45 {
@@ -355,7 +594,15 @@ fn read_enum(mem: &Mem, entry: u64) -> Option<(u64, EnumDef)> {
     }
     .to_owned();
 
-    Some((entry, EnumDef { name, repr, fields }))
+    Some((
+        entry,
+        EnumDef {
+            name,
+            repr,
+            fields,
+            vaddr: entry,
+        },
+    ))
 }
 
 fn read_fields(mem: &Mem, arr_ptr: u64, count: usize) -> anyhow::Result<Vec<Field>> {
@@ -409,25 +656,18 @@ fn arm64_store_imm(mem: &Mem, addr: u64) -> anyhow::Result<u32> {
     }
 }
 
-fn clean_uobject_sym(sym: &str) -> String {
-    static RE_STRUCT: OnceLock<Regex> = OnceLock::new();
-    static RE_ENUM: OnceLock<Regex> = OnceLock::new();
+fn clean_uobject_sym(sym: &SubType) -> String {
+    let sym_str = match sym {
+        SubType::Unresolved(a) => format!("unresolved {:X}", a),
+        SubType::None => "".to_string(),
+        SubType::Resolved(_a, b) => b.clone(),
+    };
 
-    let struct_re = RE_STRUCT.get_or_init(|| {
-        Regex::new(r"^_Z\d+Z_Construct_UScriptStruct_([A-Za-z0-9_]+)v$").expect("struct regex")
-    });
-    if let Some(caps) = struct_re.captures(sym) {
-        return caps[1].to_owned();
+    if let Some(stripped) = sym_str.strip_prefix("DevPacketData_") {
+        return stripped.to_string();
     }
 
-    let enum_re = RE_ENUM.get_or_init(|| {
-        Regex::new(r"^_Z\d+Z_Construct_UEnum_[A-Za-z0-9]+_([A-Za-z0-9]+)v$").expect("enum regex")
-    });
-    if let Some(caps) = enum_re.captures(sym) {
-        return caps[1].to_owned();
-    }
-
-    sym.to_owned()
+    sym_str.to_owned()
 }
 
 fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
@@ -449,35 +689,41 @@ fn read_field(mem: &Mem, field_addr: u64) -> anyhow::Result<Field> {
     let (offset, ty_name_opt) = match f_type {
         25 => {
             let ty_name = resolve_lazy_object(&mem, lazy_func_ptr);
-            if let Some(a) = ty_name {
-                println!("{:X} {:X} {:?}", raw_offset, a, mem.addr2name.get(&a));
-            }
-            let n = ty_name.and_then(|a| mem.addr2name.get(&a));
+            //if let Some(a) = ty_name {
+            //    println!("{:X} {:X} {:?}", raw_offset, a, mem.addr2name.get(&a));
+            //}
+            let n = match ty_name {
+                Some(a) => SubType::Unresolved(a),
+                None => SubType::None,
+            };
             (raw_offset, n)
         }
         30 => {
             let ty_name = resolve_lazy_object(&mem, lazy_func_ptr);
-            if let Some(a) = ty_name {
-                println!("{:X} {:X} {:?}", raw_offset, a, mem.addr2name.get(&a));
-            }
-            
-            let n = ty_name.and_then(|a| mem.addr2name.get(&a));
+            //if let Some(a) = ty_name {
+            //    println!("{:X} {:X} {:?}", raw_offset, a, mem.addr2name.get(&a));
+            //}
+
+            let n = match ty_name {
+                Some(a) => SubType::Unresolved(a),
+                None => SubType::None,
+            };
             (raw_offset, n)
         }
         76 => {
             let off = arm64_store_imm(mem, lazy_func_ptr + 4).unwrap_or(0xffff);
-            (off, None)
+            (off, SubType::None)
         }
-        _ => (raw_offset, None),
+        _ => (raw_offset, SubType::None),
     };
 
-    let f_type = to_field_type(f_type, ty_name_opt.clone().cloned());
+    let f_type = to_field_type(f_type, ty_name_opt.clone());
 
     Ok(Field {
         name,
         f_type,
         offset,
-        ty_ptr: ty_name_opt.cloned(),
+        ty_ptr: ty_name_opt.clone(),
         unk1,
         unk2,
         unk3,
@@ -631,7 +877,7 @@ fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<(u64, EnumDef)> {
             let addr = base + off as u64;
 
             // DEBUG: Print candidate address
-            println!("[DEBUG] Enum Candidate found at {:#x}", addr);
+            // println!("[DEBUG] Enum Candidate found at {:#x}", addr);
 
             if let Some((addr, e)) = read_enum(mem, addr) {
                 // Store the (addr, EnumDef) tuple
@@ -645,7 +891,7 @@ fn scan_for_enums(mem: &Mem, common_source: u64) -> Vec<(u64, EnumDef)> {
 fn scan_all_segments_for_packets_and_structs(
     mem: &Mem,
 ) -> Result<(Vec<PacketInfo>, Vec<PacketInfo>), anyhow::Error> {
-    let mut packets = Vec::new();
+    let packets = Vec::new();
     let mut structs = Vec::new();
     let common_source = 0x0000_0001_05d1_f850u64;
 
@@ -668,7 +914,7 @@ fn scan_all_segments_for_packets_and_structs(
             if (q0 & 0xffffffff) != (common_source & 0xffffffff) {
                 continue;
             }
-            let q1 = LittleEndian::read_u64(&slice[off + 8..off + 16]);
+            let _q1 = LittleEndian::read_u64(&slice[off + 8..off + 16]);
 
             if let Ok((_, cls)) = read_packet(&mem, addr) {
                 structs.push(cls);
@@ -682,6 +928,121 @@ fn scan_all_segments_for_packets_and_structs(
     structs.dedup_by_key(|p| p.name.clone());
 
     Ok((packets, structs))
+}
+
+fn resolve_unresolved_types(
+    packets: &mut [PacketInfo],
+    structs: &mut [PacketInfo],
+    enums: &[EnumDef],
+) {
+    let mut addr_to_name = HashMap::new();
+
+    // 1. Build a map of VAddr -> Name from Enums
+    for e in enums {
+        addr_to_name.insert(e.vaddr, e.name.clone());
+    }
+
+    // 2. Build a map of VAddr -> Name from Structs
+    for s in structs.iter() {
+        addr_to_name.insert(s.vaddr, s.name.clone());
+    }
+
+    // 3. Helper closure to resolve a single SubType
+    let resolver = |subtype: &mut SubType| {
+        if let SubType::Unresolved(addr) = subtype {
+            if let Some(name) = addr_to_name.get(addr) {
+                //println!("resolved {} {}", addr, name);
+                *subtype = SubType::Resolved(*addr, name.clone());
+            } else {
+                println!("failed to resolv {}", addr);
+            }
+        }
+    };
+
+    for pkt in packets.iter_mut() {
+        for field in pkt.fields.iter_mut() {
+            // Resolve the type pointer (ty_ptr)
+            resolver(&mut field.ty_ptr);
+
+            // Resolve the type itself (f_type)
+            match &mut field.f_type {
+                FieldType::Array(element_type) => {
+                    // Check if the element type is an unresolved struct/enum
+                    // This handles cases like: Array(Struct(Unresolved(addr)))
+                    if let FieldType::Struct(ref mut subtype)
+                    | FieldType::Enum {
+                        name: ref mut subtype,
+                        ..
+                    } = **element_type
+                    {
+                        resolver(subtype);
+                    }
+                }
+                FieldType::Map(key_type, val_type) => {
+                    for inner in [key_type, val_type] {
+                        if let FieldType::Struct(ref mut subtype)
+                        | FieldType::Enum {
+                            name: ref mut subtype,
+                            ..
+                        } = **inner
+                        {
+                            resolver(subtype);
+                        }
+                    }
+                }
+
+                FieldType::Struct(subtype) => {
+                    resolver(subtype);
+                }
+                FieldType::Enum { name: subtype, .. } => {
+                    resolver(subtype);
+                }
+                _ => {}
+            }
+        }
+    }
+    // 5. Iterate and resolve types in Structs (same logic as packets)
+    for pkt in structs.iter_mut() {
+        for field in pkt.fields.iter_mut() {
+            // Resolve the type pointer (ty_ptr)
+            resolver(&mut field.ty_ptr);
+
+            // Resolve the type itself (f_type)
+            match &mut field.f_type {
+                FieldType::Array(element_type) => {
+                    // Check if the element type is an unresolved struct/enum
+                    // This handles cases like: Array(Struct(Unresolved(addr)))
+                    if let FieldType::Struct(ref mut subtype)
+                    | FieldType::Enum {
+                        name: ref mut subtype,
+                        ..
+                    } = **element_type
+                    {
+                        resolver(subtype);
+                    }
+                }
+                FieldType::Map(key_type, val_type) => {
+                    for inner in [key_type, val_type] {
+                        if let FieldType::Struct(ref mut subtype)
+                        | FieldType::Enum {
+                            name: ref mut subtype,
+                            ..
+                        } = **inner
+                        {
+                            resolver(subtype);
+                        }
+                    }
+                }
+                FieldType::Struct(subtype) => {
+                    resolver(subtype);
+                }
+                FieldType::Enum { name: subtype, .. } => {
+                    resolver(subtype);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -699,8 +1060,7 @@ fn main() -> Result<(), anyhow::Error> {
     let mut new_symbols: Vec<(String, u64)> = Vec::new();
     let mut enums = Vec::new();
     for (addr, e) in enums_with_addr {
-        let clean_name = clean_uobject_sym(&e.name);
-        new_symbols.push((clean_name, addr));
+        new_symbols.push((e.name.clone(), addr));
         enums.push(e);
     }
 
@@ -713,6 +1073,19 @@ fn main() -> Result<(), anyhow::Error> {
         structs.len()
     );
 
+    resolve_unresolved_types(&mut packets, &mut structs, &enums);
+
+    let prefix = "DevPacketData_";
+    packets.retain(|p| p.name.starts_with(prefix));
+    structs.retain(|s| s.name.starts_with(prefix));
+    println!(
+        "Filtered -> {} packets, {} structs",
+        packets.len(),
+        structs.len()
+    );
+
+    let json = serde_json::to_string_pretty(&structs)?;
+    fs::write("structs.json", &json)?;
     let json = serde_json::to_string_pretty(&packets)?;
     fs::write("packets.json", &json)?;
     let json = serde_json::to_string_pretty(&enums)?;
@@ -721,6 +1094,12 @@ fn main() -> Result<(), anyhow::Error> {
     fs::create_dir_all("out").ok();
     packets.extend(structs);
     let per_part = (packets.len() + 63) / 64;
+
+    let opcodes_ex = generate_opcodes_elixir(&packets);
+    fs::write("out/opcodes.ex", opcodes_ex)?;
+
+    let enums_ex = generate_enums_elixir(&enums);
+    fs::write("out/enums.ex", enums_ex)?;
 
     for (idx, chunk) in packets.chunks(per_part).enumerate() {
         if chunk.is_empty() {
@@ -761,11 +1140,68 @@ fn elixir_type(ft: &FieldType) -> String {
         Array(elem) => format!("list({})", elixir_type(elem)),
         Struct(raw) => format!("PacketDSL.struct({})", clean_uobject_sym(raw)),
         Enum { name, .. } => format!("PacketDSL.enum({})", clean_uobject_sym(name)),
+        Map(name, name1) => format!(
+            "PacketDSL.map({}, {})",
+            elixir_type(name),
+            elixir_type(name1)
+        ),
         Unresolved => ":unresolved".into(),
         Unknown(code) => format!("PacketDSL.unknown({})", code),
     }
 }
 
+fn generate_opcodes_elixir(packets: &[PacketInfo]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(4096);
+    writeln!(out, "# Auto-generated: DO NOT EDIT").unwrap();
+    writeln!(out, "defmodule PacketOpcodes do").unwrap();
+    writeln!(out, "  @opcodes %{{").unwrap();
+
+    let mut pairs: Vec<_> = packets
+        .iter()
+        .filter_map(|p| p.opcode.map(|op| (op, &p.name)))
+        .filter(|(op, _)| *op != 0)
+        .collect();
+
+    pairs.sort_by_key(|(op, _)| *op);
+
+    for (opcode, name) in pairs {
+        let stripped = name.strip_prefix("DevPacketData_").unwrap_or(name);
+        writeln!(out, "    {} => :{},", opcode, elixir_atom(stripped)).unwrap();
+    }
+
+    writeln!(out, "  }}").unwrap();
+    writeln!(out, "").unwrap();
+    writeln!(out, "  def mapping, do: @opcodes").unwrap();
+    writeln!(out, "end").unwrap();
+    out
+}
+fn generate_enums_elixir(enums: &[EnumDef]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(8192);
+    writeln!(out, "# Auto-generated: DO NOT EDIT").unwrap();
+    writeln!(out, "import PacketDSL\n").unwrap();
+
+    for e in enums {
+        // Reuse clean_uobject_sym logic for name stripping by wrapping in a fake Resolved type
+        // or just manually strip since clean_uobject_sym takes SubType.
+        // Manual strip is cleaner here.
+        let stripped_name = e.name.strip_prefix("DevPacketData_").unwrap_or(&e.name);
+        let atom_name = elixir_atom(stripped_name);
+
+        let repr = format!(":{}", e.repr); // e.g., :u8, :i32
+
+        writeln!(out, "enum :{}, {} do", atom_name, repr).unwrap();
+        for (field_name, val) in &e.fields {
+            // Enum fields usually don't need snake_case conversion in packet defs,
+            // but if desired, apply elixir_atom here too.
+            // Usually enums are accessed as MyEnum.ValueName.
+            writeln!(out, "  value :{}, {}", field_name, val).unwrap();
+        }
+        writeln!(out, "end\n").unwrap();
+    }
+    out
+}
 fn generate_elixir_chunk(packets: &[PacketInfo]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(2048);
@@ -773,7 +1209,13 @@ fn generate_elixir_chunk(packets: &[PacketInfo]) -> String {
     writeln!(out, "import PacketDSL\n").unwrap();
 
     for pkt in packets {
-        writeln!(out, "packet {} do", pkt.name).unwrap();
+        let name = pkt.name.strip_prefix("DevPacketData_").unwrap_or(&pkt.name);
+        writeln!(out, "packet {} do", name).unwrap();
+        if let Some(opc) = pkt.opcode {
+            if opc != 0 {
+                writeln!(out, "  opcode {}", opc).unwrap();
+            }
+        }
         for f in &pkt.fields {
             writeln!(
                 out,
