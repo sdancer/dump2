@@ -1,4 +1,5 @@
 mod codegen;
+mod codegen_rust;
 mod disasm;
 mod memory;
 mod scanner;
@@ -11,6 +12,7 @@ use std::fs::{self, File};
 use std::path::Path;
 
 use crate::codegen::{generate_elixir_chunk, generate_enums_elixir, generate_opcodes_elixir};
+use crate::codegen_rust::{generate_enums_rust, generate_structs_rust, generate_opcodes_rust};
 use crate::memory::Mem;
 use crate::scanner::{scan_all_segments_for_packets_and_structs, scan_for_enums};
 use crate::types::{EnumDef, FieldType, PacketInfo, SubType};
@@ -157,6 +159,34 @@ fn main() -> Result<(), anyhow::Error> {
         let body = generate_elixir_chunk(chunk);
         fs::write(&fname, body)?;
     }
+
+fs::create_dir_all("out_rust").ok();
+
+    // 1. Generate Enums
+    let enums_rs = generate_enums_rust(&enums);
+    fs::write("out_rust/enums.rs", enums_rs)?;
+
+    // 2. Generate Structs/Packets
+    // In original code, packets and structs were merged
+    let mut all_packets = packets;
+    all_packets.extend(structs);
+    
+    let structs_rs = generate_structs_rust(&all_packets);
+    fs::write("out_rust/packets.rs", structs_rs)?;
+
+    // 3. Generate Opcodes
+    let opcodes_rs = generate_opcodes_rust(&all_packets);
+    fs::write("out_rust/opcodes.rs", opcodes_rs)?;
+
+    // 4. Generate a mod.rs for convenience
+    let mod_rs = r#"
+pub mod enums;
+pub mod packets;
+pub mod opcodes;
+"#;
+    fs::write("out_rust/mod.rs", mod_rs)?;
+
+    Ok(())
 
     Ok(())
 }
